@@ -1,0 +1,735 @@
+package pglogrepl
+
+import (
+	"bytes"
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"hash/crc32"
+	"os"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgtype"
+)
+
+type Config struct {
+	Host     string
+	Port     int
+	Username string
+	Password string
+	Database string
+	SSLMode  string
+	Tables   []string
+	Schema   string
+	PubName  string
+	SlotName string
+	LSNFile  string
+	Logger   Logger
+}
+
+type PgLogRepl struct {
+	dsn          string
+	database     string
+	schema       string
+	tables       []Table
+	pubName      string
+	slotName     string
+	forAllTables bool
+
+	lsn *LSN
+	log Logger
+
+	mu  sync.RWMutex
+	cbs map[Event]EventCallback
+	err error
+
+	status atomic.Int32
+	closed chan chan struct{}
+}
+
+func New(config Config) *PgLogRepl {
+	schema := cmp.Or(config.Schema, "public")
+	publication := cmp.Or(config.PubName, "pglogrepl_demo")
+
+	repl := &PgLogRepl{
+		dsn: fmt.Sprintf(
+			"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+			cmp.Or(config.Host, "localhost"),
+			cmp.Or(config.Port, 5432),
+			config.Username, config.Password, config.Database,
+			cmp.Or(config.SSLMode, "disable"),
+		),
+		database:     config.Database,
+		schema:       schema,
+		pubName:      publication,
+		slotName:     cmp.Or(config.SlotName, publication+"_sync_slot"),
+		forAllTables: len(config.Tables) == 0,
+
+		lsn:    &LSN{filename: config.LSNFile},
+		cbs:    make(map[Event]EventCallback),
+		log:    config.Logger,
+		closed: make(chan chan struct{}),
+	}
+
+	if n := len(config.Tables); n > 0 {
+		repl.tables = make([]Table, n)
+		for i, name := range config.Tables {
+			repl.tables[i] = newTable(schema, name)
+		}
+		slices.SortFunc(repl.tables, func(a, b Table) int {
+			return strings.Compare(a.String(), b.String())
+		})
+	}
+
+	if repl.log == nil {
+		repl.log = LoggerFunc(func(level, format string, args ...any) {
+			if len(args) > 0 {
+				format = fmt.Sprintf(format, args...)
+			}
+			fmt.Fprintf(
+				os.Stdout,
+				"%s %s [pglogrepl] %s\n",
+				time.Now().Format(time.DateTime),
+				level,
+				format,
+			)
+		})
+	}
+
+	return repl
+}
+
+func (p *PgLogRepl) Status() int32 {
+	return p.status.Load()
+}
+
+func (p *PgLogRepl) Err() error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.err
+}
+
+func (p *PgLogRepl) setError(err error) {
+	p.mu.Lock()
+	p.err = err
+	p.mu.Unlock()
+
+	p.Stop()
+}
+
+func (p *PgLogRepl) hasTable(table Table) bool {
+	return slices.ContainsFunc(p.tables, table.Equal)
+}
+
+func (p *PgLogRepl) Start(ctx context.Context) error {
+	if !p.status.CompareAndSwap(StatusStopped, StatusStarting) {
+		return errors.New("already started")
+	}
+
+	if err := p.initLSN(); err != nil {
+		p.status.Store(StatusStopped)
+		return err
+	}
+
+	if err := p.initTables(ctx); err != nil {
+		p.status.Store(StatusStopped)
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		defer cancel()
+		exit := <-p.closed
+		exit <- struct{}{}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				err := p.lsn.Persist()
+				if err != nil {
+					p.log.LogError("failed to persist lsn: %v", err)
+				}
+			}
+		}
+	}()
+
+	errChan := make(chan error)
+	defer close(errChan)
+
+	if !p.lsn.Valid() {
+		go p.fullSync(ctx, func(err error) {
+			if err != nil {
+				p.status.CompareAndSwap(StatusStarting, StatusSyncing)
+			}
+			errChan <- err
+		})
+	} else {
+		go p.incrementalSync(ctx, func(err error) {
+			if err != nil {
+				p.status.CompareAndSwap(StatusStarting, StatusListening)
+			}
+			errChan <- err
+		})
+	}
+
+	if err := <-errChan; err != nil {
+		p.status.Store(StatusStopped)
+		return err
+	}
+
+	if err := p.Err(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (p *PgLogRepl) initLSN() error {
+	tables := "*"
+	if !p.forAllTables {
+		tables = ""
+		for i, t := range p.tables {
+			if i > 0 {
+				tables += ","
+			}
+			tables += t.String()
+		}
+	}
+
+	p.lsn.checksum = crc32.ChecksumIEEE(fmt.Appendf(
+		nil, "%s %s %s %s %s",
+		p.database,
+		p.schema,
+		tables,
+		p.pubName,
+		p.slotName,
+	))
+
+	if err := p.lsn.Reload(); err != nil {
+		if !errors.Is(err, errLSN) {
+			return err
+		}
+		p.log.LogInfo("%s", err.Error())
+	}
+
+	return nil
+}
+
+func (p *PgLogRepl) initTables(ctx context.Context) error {
+	if !p.forAllTables {
+		return nil
+	}
+
+	conn, err := pgconn.Connect(ctx, p.dsn)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(ctx)
+
+	sql := "SELECT table_schema||'.'||table_name FROM information_schema.tables WHERE table_schema='%s'"
+	results, err := conn.Exec(ctx, fmt.Sprintf(sql, p.schema)).ReadAll()
+	if err != nil {
+		return err
+	}
+	for _, result := range results {
+		for _, data := range result.Rows {
+			p.tables = append(p.tables, Table(string(data[0])))
+		}
+	}
+	slices.SortFunc(p.tables, func(a, b Table) int {
+		return strings.Compare(a.String(), b.String())
+	})
+	return nil
+}
+
+func (p *PgLogRepl) fullSync(ctx context.Context, onDone func(error)) {
+	// 创建快照连接
+	snapConn, err := pgconn.Connect(ctx, p.dsn)
+	if err != nil {
+		onDone(err)
+		return
+	}
+	defer snapConn.Close(ctx)
+
+	// 开启事务且设置隔离级别为 REPEATABLE READ
+	_, err = snapConn.Exec(ctx, "BEGIN ISOLATION LEVEL REPEATABLE READ").ReadAll()
+	if err != nil {
+		onDone(err)
+		return
+	}
+	// 导出快照
+	rows, err := snapConn.Exec(ctx, "SELECT pg_export_snapshot()").ReadAll()
+	if err != nil {
+		snapConn.Exec(ctx, "ROLLBACK")
+		onDone(err)
+		return
+	}
+	if len(rows) == 0 || len(rows[0].Rows) == 0 {
+		snapConn.Exec(ctx, "ROLLBACK")
+		onDone(fmt.Errorf("no snapshot returned"))
+		return
+	}
+
+	// 由于我们利用一致性快照实现数据的全量同步，
+	// 就必须保证快照和同步的事务同时存在，所以
+	// 这里使用 defer 保证事务在全量同步时可用。
+	defer snapConn.Exec(ctx, "COMMIT")
+
+	// 获取快照名称
+	snapshotName := string(rows[0].Rows[0][0])
+
+	// 创建全量同步连接
+	syncConn, err := pgconn.Connect(ctx, p.dsn)
+	if err != nil {
+		onDone(err)
+		return
+	}
+	defer syncConn.Close(ctx)
+
+	// 开启事务
+	_, err = syncConn.Exec(ctx, "BEGIN ISOLATION LEVEL REPEATABLE READ").ReadAll()
+	if err != nil {
+		onDone(err)
+		return
+	}
+
+	setSnapSQL := fmt.Sprintf("SET TRANSACTION SNAPSHOT '%s'", snapshotName)
+	if _, err = syncConn.Exec(ctx, setSnapSQL).ReadAll(); err != nil {
+		syncConn.Exec(ctx, "ROLLBACK")
+		onDone(err)
+		return
+	}
+
+	// 启动完成
+	p.status.CompareAndSwap(StatusStarting, StatusSyncing)
+	onDone(nil)
+
+	// 开始全量同步
+	for _, tbl := range p.tables {
+		sql := fmt.Sprintf("SELECT * FROM %s;", tbl.String())
+		res := syncConn.ExecParams(ctx, sql, nil, nil, nil, nil)
+
+		colNames := res.FieldDescriptions()
+		for res.NextRow() {
+			rowData := make(map[string]any)
+			vals := res.Values()
+			for i, v := range vals {
+				rowData[colNames[i].Name] = string(v)
+			}
+			if !p.dispatch(EventInsert, tbl, rowData) {
+				return
+			}
+		}
+
+		if _, err = res.Close(); err != nil {
+			syncConn.Exec(ctx, "ROLLBACK")
+			p.setError(err)
+			return
+		}
+	}
+
+	// 提交事务
+	_, err = syncConn.Exec(ctx, "COMMIT").ReadAll()
+	if err != nil {
+		p.setError(err)
+		return
+	}
+
+	// 开始监听数据库变化，实现增量同步
+	if p.Err() == nil {
+		go p.incrementalSync(ctx, func(err error) {
+			if err != nil {
+				p.setError(err)
+				return
+			}
+			if !p.status.CompareAndSwap(StatusSyncing, StatusListening) {
+				p.log.LogError("Failed to listen for incremental sync")
+			}
+		})
+	}
+}
+
+// 增量同步
+func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
+	conn, err := pgconn.Connect(ctx, p.dsn+" replication=database")
+	if err != nil {
+		onDone(err)
+		return
+	}
+	defer conn.Close(ctx)
+
+	// 创建 publication
+	err = p.ensurePublication(ctx, conn)
+	if err != nil {
+		onDone(err)
+		return
+	}
+
+	// 创建插槽
+	err = p.ensureReplicationSlot(ctx, conn)
+	if err != nil {
+		onDone(err)
+		return
+	}
+
+	// 确保同步位置正确
+	sysident, err := pglogrepl.IdentifySystem(ctx, conn)
+	if err != nil {
+		onDone(err)
+		return
+	}
+	p.log.LogInfo(
+		"SystemID=%q Timeline=%d XLogPos=%q DBName=%q",
+		sysident.SystemID,
+		sysident.Timeline,
+		sysident.XLogPos,
+		sysident.DBName,
+	)
+
+	startLSN := min(p.lsn.Get(), sysident.XLogPos)
+
+	// 启动插槽
+	err = pglogrepl.StartReplication(ctx, conn, p.slotName, startLSN, pglogrepl.StartReplicationOptions{
+		// streaming of large transactions is available since PG 14 (protocol version 2)
+		// we also need to set 'streaming' to 'true'
+		PluginArgs: []string{
+			"proto_version '2'",
+			fmt.Sprintf("publication_names '%s'", p.pubName),
+			"messages 'true'",
+			"streaming 'true'",
+		},
+	})
+	if err != nil {
+		onDone(err)
+		return
+	}
+	p.log.LogInfo("logical replication started on slot %q", p.slotName)
+
+	// 启动完成
+	onDone(nil)
+
+	clientXLogPos := startLSN
+	standbyMessageTimeout := time.Second * 10
+	nextStandbyMessageDeadline := time.Now().Add(standbyMessageTimeout)
+	relationsV2 := map[uint32]*pglogrepl.RelationMessageV2{}
+	typeMap := pgtype.NewMap()
+
+	dispatch := func(event Event, relationID uint32, tuple *pglogrepl.TupleData) bool {
+		rel, ok := relationsV2[relationID]
+		if !ok {
+			p.log.LogError("unknown relation ID %d", relationID)
+			return true
+		}
+
+		values := map[string]any{}
+		for idx, col := range tuple.Columns {
+			colName := rel.Columns[idx].Name
+			switch col.DataType {
+			case 'n': // null
+				values[colName] = nil
+			case 'u': // unchanged toast
+				// This TOAST value was not changed. TOAST values are not stored in the tuple,
+				// and logical replication doesn't want to spend a disk read to fetch its value for you.
+			case 't': //text
+				values[colName], err = decodeTextColumnData(typeMap, col.Data, rel.Columns[idx].DataType)
+				if err != nil {
+					p.setError(fmt.Errorf("error decoding column data: %w", err))
+					return false
+				}
+			}
+		}
+
+		tbl := newTable(rel.Namespace, rel.RelationName)
+
+		p.log.LogInfo("dispatch event %q, table %q, values %v", event, tbl, values)
+
+		return p.dispatch(event, tbl, values)
+	}
+
+	// whenever we get StreamStartMessage we set inStream to true and then pass it to DecodeV2 function
+	// on StreamStopMessage we set it back to false
+	inStream := false
+
+	// 监听数据库变化，实现增量同步
+	for {
+		if time.Now().After(nextStandbyMessageDeadline) {
+			err = pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{
+				WALWritePosition: clientXLogPos,
+			})
+			if err != nil {
+				p.setError(err)
+				return
+			}
+			p.log.LogInfo("sent standby status message at %q", clientXLogPos)
+			nextStandbyMessageDeadline = time.Now().Add(standbyMessageTimeout)
+		}
+
+		subCtx, cancel := context.WithDeadline(ctx, nextStandbyMessageDeadline)
+		rawMsg, err := conn.ReceiveMessage(subCtx)
+		cancel()
+		if err != nil {
+			if pgconn.Timeout(err) {
+				continue
+			}
+			p.setError(fmt.Errorf("ReceiveMessage failed: %w", err))
+			return
+		}
+
+		if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
+			p.setError(fmt.Errorf("received Postgres WAL error: %+v", errMsg))
+			return
+		}
+
+		msg, ok := rawMsg.(*pgproto3.CopyData)
+		if !ok {
+			p.log.LogInfo("Received unexpected message: %T", rawMsg)
+			continue
+		}
+
+		switch msg.Data[0] {
+		case pglogrepl.PrimaryKeepaliveMessageByteID:
+			pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
+			if err != nil {
+				p.setError(err)
+				return
+			}
+			p.log.LogInfo(
+				"Primary Keepalive Message => ServerWALEnd %q ServerTime %q ReplyRequested %t",
+				pkm.ServerWALEnd,
+				pkm.ServerTime,
+				pkm.ReplyRequested,
+			)
+			if pkm.ServerWALEnd > clientXLogPos {
+				clientXLogPos = pkm.ServerWALEnd
+				p.lsn.Set(clientXLogPos)
+			}
+			if pkm.ReplyRequested {
+				nextStandbyMessageDeadline = time.Time{}
+			}
+
+		case pglogrepl.XLogDataByteID:
+			xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
+			if err != nil {
+				p.setError(err)
+				return
+			}
+
+			p.log.LogInfo(
+				"XLogData => WALStart %q ServerWALEnd %q ServerTime %q WALData",
+				xld.WALStart, xld.ServerWALEnd, xld.ServerTime,
+			)
+
+			logicalMsg, err := pglogrepl.ParseV2(xld.WALData, inStream)
+			if err != nil {
+				p.setError(fmt.Errorf("failed to parse logical replication message: %w", err))
+				return
+			}
+			p.log.LogInfo("Receive a logical replication message: %s", logicalMsg.Type())
+
+			switch logicalMsg := logicalMsg.(type) {
+			case *pglogrepl.RelationMessageV2:
+				relationsV2[logicalMsg.RelationID] = logicalMsg
+
+			case *pglogrepl.BeginMessage:
+				// Indicates the beginning of a group of changes in a transaction.
+				// This is only sent for committed transactions. You won't get any
+				// events from rolled back transactions.
+
+			case *pglogrepl.CommitMessage:
+				clear(relationsV2)
+
+			case *pglogrepl.InsertMessageV2:
+				p.log.LogInfo("insert for xid %d", logicalMsg.Xid)
+				if !dispatch(EventInsert, logicalMsg.RelationID, logicalMsg.Tuple) {
+					return
+				}
+
+			case *pglogrepl.UpdateMessageV2:
+				p.log.LogInfo("update for xid %d", logicalMsg.Xid)
+				if !dispatch(EventUpdate, logicalMsg.RelationID, logicalMsg.NewTuple) {
+					return
+				}
+
+			case *pglogrepl.DeleteMessageV2:
+				p.log.LogInfo("delete for xid %d", logicalMsg.Xid)
+				if !dispatch(EventDelete, logicalMsg.RelationID, logicalMsg.OldTuple) {
+					return
+				}
+
+			case *pglogrepl.TruncateMessageV2:
+				p.log.LogInfo("truncate for xid %d", logicalMsg.Xid)
+				// TODO: Implement truncate event dispatching
+
+			case *pglogrepl.TypeMessageV2:
+			case *pglogrepl.OriginMessage:
+
+			case *pglogrepl.LogicalDecodingMessageV2:
+				p.log.LogInfo("Logical decoding message: %q, %q, %d", logicalMsg.Prefix, logicalMsg.Content, logicalMsg.Xid)
+
+			case *pglogrepl.StreamStartMessageV2:
+				inStream = true
+				p.log.LogInfo("Stream start message: xid %d, first segment? %d", logicalMsg.Xid, logicalMsg.FirstSegment)
+			case *pglogrepl.StreamStopMessageV2:
+				inStream = false
+				p.log.LogInfo("Stream stop message")
+			case *pglogrepl.StreamCommitMessageV2:
+				p.log.LogInfo("Stream commit message: xid %d", logicalMsg.Xid)
+				clear(relationsV2)
+			case *pglogrepl.StreamAbortMessageV2:
+				p.log.LogInfo("Stream abort message: xid %d", logicalMsg.Xid)
+			default:
+				p.log.LogInfo("Unknown message type in pgoutput stream: %T", logicalMsg)
+			}
+
+			if xld.WALStart > clientXLogPos {
+				clientXLogPos = xld.WALStart
+				p.lsn.Set(clientXLogPos)
+			}
+		}
+	}
+}
+
+func (p *PgLogRepl) ensurePublication(ctx context.Context, conn *pgconn.PgConn) error {
+	checkSQL := fmt.Sprintf("SELECT 1 FROM pg_publication WHERE pubname = '%s'", p.pubName)
+	pgRes, err := conn.Exec(ctx, checkSQL).ReadAll()
+	if err != nil {
+		return err
+	}
+
+	// 存在 publication
+	if len(pgRes) > 0 && len(pgRes[0].Rows) > 0 {
+		sql := "SELECT schemaname||'.'||tablename FROM pg_publication_tables WHERE pubname = '%s'"
+		pgRes, err = conn.Exec(ctx, fmt.Sprintf(sql, p.pubName)).ReadAll()
+		if err != nil {
+			return err
+		}
+		var intersects int
+		for _, result := range pgRes {
+			for _, row := range result.Rows {
+				if p.hasTable(Table(row[0])) {
+					// 允许数据库中的表多于指定的表，所以这里只统计交集
+					intersects++
+				}
+			}
+		}
+		// 指定的表是 publication 关联表的子集
+		if intersects == len(p.tables) {
+			return nil
+		}
+
+		// 检查并删除插槽
+		checkSQL = "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1"
+		res := conn.ExecParams(ctx, checkSQL, nil, nil, nil, nil).Read()
+		if res.Err != nil {
+			return res.Err
+		}
+		if len(res.Rows) > 0 {
+			dropSlotSQL := fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", p.slotName)
+			_, err = conn.Exec(ctx, dropSlotSQL).ReadAll()
+			if err != nil {
+				return err
+			}
+		}
+
+		dropPubSQL := fmt.Sprintf("DROP PUBLICATION %s;", p.pubName)
+		_, err = conn.Exec(ctx, dropPubSQL).ReadAll()
+		if err != nil {
+			return err
+		}
+	}
+
+	createSQL := fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES;", p.pubName)
+	if !p.forAllTables {
+		var tables []string
+		for _, table := range p.tables {
+			tables = append(tables, table.String())
+		}
+		createSQL = strings.ReplaceAll(
+			createSQL,
+			"FOR ALL TABLES",
+			"FOR TABLE "+strings.Join(tables, ","),
+		)
+	}
+	_, err = conn.Exec(ctx, createSQL).ReadAll()
+	return err
+}
+
+func (p *PgLogRepl) ensureReplicationSlot(ctx context.Context, conn *pgconn.PgConn) error {
+	findSQL := "SELECT slot_name, plugin, slot_type, database, temporary FROM pg_replication_slots WHERE slot_name = '%s'"
+	results, err := conn.Exec(ctx, fmt.Sprintf(findSQL, p.slotName)).ReadAll()
+	if err != nil {
+		return fmt.Errorf("failed to get replication slot: %w", err)
+	}
+
+	if len(results) > 0 && len(results[0].Rows) > 0 {
+		for _, row := range results[0].Rows {
+			if !bytes.EqualFold(row[3], []byte(p.database)) {
+				p.log.LogError("expect database '%s', got '%s'", p.database, row[3])
+				return fmt.Errorf("expect database '%s', got '%s'", p.database, row[3])
+			}
+
+			// 检查属性是否一致
+			if !bytes.EqualFold(row[1], []byte("pgoutput")) ||
+				bytes.EqualFold(row[4], []byte{'t'}) ||
+				!bytes.EqualFold(row[2], []byte("LOGICAL")) {
+				dropSQL := "SELECT pg_drop_replication_slot('%s')"
+				_, err = conn.Exec(ctx, fmt.Sprintf(dropSQL, p.slotName)).ReadAll()
+				if err != nil {
+					return err
+				}
+				p.log.LogInfo("Dropped replication slot: %q", p.slotName)
+				continue
+			}
+
+			return nil
+		}
+	}
+
+	_, err = pglogrepl.CreateReplicationSlot(ctx, conn, p.slotName, "pgoutput", pglogrepl.CreateReplicationSlotOptions{
+		Temporary:      false,
+		SnapshotAction: "EXPORT_SNAPSHOT",
+		Mode:           pglogrepl.LogicalReplication,
+	})
+
+	return err
+}
+
+func decodeTextColumnData(mi *pgtype.Map, data []byte, dataType uint32) (any, error) {
+	if dt, ok := mi.TypeForOID(dataType); ok {
+		return dt.Codec.DecodeValue(mi, dataType, pgtype.TextFormatCode, data)
+	}
+	return string(data), nil
+}
+
+func (p *PgLogRepl) Stop() error {
+	switch p.Status() {
+	case StatusStopped, StatusStopping:
+		return nil
+	default:
+		p.status.Store(StatusStopping)
+	}
+
+	stop := make(chan struct{})
+	p.closed <- stop
+	<-stop
+
+	p.status.Store(StatusStopped)
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.err
+}
