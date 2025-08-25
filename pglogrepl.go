@@ -318,6 +318,8 @@ func (p *PgLogRepl) fullSync(ctx context.Context, onDone func(error)) {
 	p.status.CompareAndSwap(StatusStarting, StatusSyncing)
 	onDone(nil)
 
+	typeMap := pgtype.NewMap()
+
 	// 开始全量同步
 	for _, tbl := range p.tables {
 		sql := fmt.Sprintf("SELECT * FROM %s;", tbl.String())
@@ -328,7 +330,13 @@ func (p *PgLogRepl) fullSync(ctx context.Context, onDone func(error)) {
 			rowData := make(map[string]any)
 			vals := res.Values()
 			for i, v := range vals {
-				rowData[colNames[i].Name] = string(v)
+				data, err := decodeTextColumnData(typeMap, v, colNames[i].DataTypeOID)
+				if err != nil {
+					p.setError(fmt.Errorf("error decoding column data: %w", err))
+					return
+				}
+				//rowData[colNames[i].Name] = string(v)
+				rowData[colNames[i].Name] = data
 			}
 			if !p.dispatch(EventInsert, tbl, rowData) {
 				return
