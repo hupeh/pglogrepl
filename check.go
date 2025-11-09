@@ -186,7 +186,10 @@ func (r *CheckResult) String() string {
 	}
 
 	if !r.Supported {
-		sb.WriteString("\nTo fix these issues, update postgresql.conf:\n")
+		sb.WriteString("\n=== Configuration Fix Options ===\n\n")
+
+		sb.WriteString("Option 1: Edit postgresql.conf manually\n")
+		sb.WriteString("----------------------------------------\n")
 		if !r.WALLevelCorrect {
 			sb.WriteString("  wal_level = logical\n")
 		}
@@ -196,6 +199,20 @@ func (r *CheckResult) String() string {
 		if r.MaxWalSenders == 0 {
 			sb.WriteString("  max_wal_senders = 4\n")
 		}
+		sb.WriteString("\nThen restart PostgreSQL for changes to take effect.\n\n")
+
+		sb.WriteString("Option 2: Use SQL commands (requires SUPERUSER)\n")
+		sb.WriteString("------------------------------------------------\n")
+		if !r.WALLevelCorrect {
+			sb.WriteString("  ALTER SYSTEM SET wal_level = 'logical';\n")
+		}
+		if r.MaxReplicationSlots == 0 {
+			sb.WriteString("  ALTER SYSTEM SET max_replication_slots = 4;\n")
+		}
+		if r.MaxWalSenders == 0 {
+			sb.WriteString("  ALTER SYSTEM SET max_wal_senders = 4;\n")
+		}
+		sb.WriteString("  SELECT pg_reload_conf();\n")
 		sb.WriteString("\nThen restart PostgreSQL for changes to take effect.\n")
 	}
 
@@ -254,97 +271,4 @@ func (r *CheckResult) ConfigSQL() string {
 	}
 
 	return sb.String()
-}
-
-// TryApplyConfig attempts to apply the required configuration using ALTER SYSTEM.
-//
-// This function will:
-//   - Execute ALTER SYSTEM commands to update postgresql.conf
-//   - Reload configuration with pg_reload_conf()
-//   - Return instructions for restarting PostgreSQL
-//
-// Requirements:
-//   - The database user must have SUPERUSER privileges
-//   - PostgreSQL must allow ALTER SYSTEM commands
-//   - You must restart PostgreSQL after this function succeeds
-//
-// Returns:
-//   - bool: true if any configuration was changed
-//   - string: instructions for completing the setup (usually restart info)
-//   - error: any error that occurred
-//
-// Example:
-//
-//	result, _ := pglogrepl.CheckLogicalReplication(ctx, dsn)
-//	if !result.Supported {
-//	    changed, instructions, err := result.TryApplyConfig(ctx, dsn)
-//	    if err != nil {
-//	        log.Printf("Failed to apply config: %v", err)
-//	        log.Printf("Try running manually:\n%s", result.ConfigSQL())
-//	    } else if changed {
-//	        log.Println(instructions)
-//	    }
-//	}
-func (r *CheckResult) TryApplyConfig(ctx context.Context, dsn string) (bool, string, error) {
-	if r.Supported {
-		return false, "Configuration is already correct", nil
-	}
-
-	conn, err := pgconn.Connect(ctx, dsn)
-	if err != nil {
-		return false, "", fmt.Errorf("failed to connect: %w", err)
-	}
-	defer conn.Close(ctx)
-
-	changed := false
-
-	// Apply wal_level
-	if !r.WALLevelCorrect {
-		result := conn.ExecParams(ctx, "ALTER SYSTEM SET wal_level = 'logical'", nil, nil, nil, nil)
-		if result.Read().Err != nil {
-			return false, "", fmt.Errorf("failed to set wal_level (requires SUPERUSER): %w", result.Read().Err)
-		}
-		changed = true
-	}
-
-	// Apply max_replication_slots
-	if r.MaxReplicationSlots < 4 {
-		result := conn.ExecParams(ctx, "ALTER SYSTEM SET max_replication_slots = 4", nil, nil, nil, nil)
-		if result.Read().Err != nil {
-			return false, "", fmt.Errorf("failed to set max_replication_slots (requires SUPERUSER): %w", result.Read().Err)
-		}
-		changed = true
-	}
-
-	// Apply max_wal_senders
-	if r.MaxWalSenders < 4 {
-		result := conn.ExecParams(ctx, "ALTER SYSTEM SET max_wal_senders = 4", nil, nil, nil, nil)
-		if result.Read().Err != nil {
-			return false, "", fmt.Errorf("failed to set max_wal_senders (requires SUPERUSER): %w", result.Read().Err)
-		}
-		changed = true
-	}
-
-	if changed {
-		// Reload configuration
-		result := conn.ExecParams(ctx, "SELECT pg_reload_conf()", nil, nil, nil, nil)
-		if result.Read().Err != nil {
-			return true, "", fmt.Errorf("configuration changed but failed to reload: %w", result.Read().Err)
-		}
-
-		instructions := `Configuration has been updated successfully!
-
-IMPORTANT: You must restart PostgreSQL for changes to take effect.
-
-Methods to restart:
-  - Using systemctl: sudo systemctl restart postgresql
-  - Using pg_ctl: pg_ctl restart -D /path/to/data
-  - Using Docker: docker restart <container>
-
-After restart, run CheckLogicalReplication() again to verify.`
-
-		return true, instructions, nil
-	}
-
-	return false, "No changes were needed", nil
 }
