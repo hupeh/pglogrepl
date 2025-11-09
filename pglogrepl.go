@@ -1,3 +1,104 @@
+// Package pglogrepl provides PostgreSQL logical replication support with both full and incremental synchronization.
+//
+// This package implements a complete solution for tracking PostgreSQL database changes using logical replication.
+// It supports initial full synchronization using consistent snapshots and continuous incremental synchronization
+// through logical replication slots.
+//
+// # Features
+//
+//   - Full table synchronization using consistent snapshots
+//   - Incremental synchronization via logical replication
+//   - Automatic publication and replication slot management
+//   - LSN (Log Sequence Number) persistence for crash recovery
+//   - Event callbacks for INSERT, UPDATE, DELETE, and TRUNCATE operations
+//   - Support for schema filtering and table-specific replication
+//
+// # Basic Usage
+//
+//	config := pglogrepl.Config{
+//	    Host:     "localhost",
+//	    Port:     5432,
+//	    Username: "postgres",
+//	    Password: "password",
+//	    Database: "mydb",
+//	    Tables:   []string{"users", "orders"}, // or empty for all tables
+//	    Schema:   "public",
+//	    LSNFile:  "/var/lib/myapp/lsn.dat",
+//	}
+//
+//	repl := pglogrepl.New(config)
+//
+//	// Set event callbacks
+//	repl.SetCallback(pglogrepl.EventInsert, func(table pglogrepl.Table, data map[string]any) {
+//	    log.Printf("INSERT on %s: %v", table, data)
+//	})
+//
+//	repl.SetCallback(pglogrepl.EventUpdate, func(table pglogrepl.Table, data map[string]any) {
+//	    log.Printf("UPDATE on %s: %v", table, data)
+//	})
+//
+//	// Start replication
+//	if err := repl.Start(context.Background()); err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	// Gracefully stop
+//	defer repl.Stop()
+//
+// # Synchronization Process
+//
+// When starting without a valid LSN (first run):
+//
+//  1. Creates a database snapshot with REPEATABLE READ isolation
+//  2. Performs full table synchronization from the snapshot
+//  3. Transitions to incremental synchronization mode
+//  4. Starts listening for WAL changes via logical replication
+//
+// When starting with a valid LSN (recovery):
+//
+//  1. Directly starts incremental synchronization from the saved LSN
+//  2. Continues processing WAL changes from where it left off
+//
+// # LSN Persistence
+//
+// The package maintains a Log Sequence Number (LSN) file to track replication progress.
+// This enables crash recovery and prevents data loss or duplication:
+//
+//   - LSN is written to file on every change (buffered)
+//   - Periodic sync to disk (every minute by default)
+//   - Automatic recovery on restart
+//   - Checksum validation for file integrity
+//
+// # Status Monitoring
+//
+// The replication process goes through several states:
+//
+//   - StatusStopped: Not running
+//   - StatusStarting: Initializing connections and slots
+//   - StatusSyncing: Performing full synchronization
+//   - StatusListening: Active incremental replication
+//   - StatusStopping: Gracefully shutting down
+//
+// Check current status with:
+//
+//	status := repl.Status()
+//	name := pglogrepl.StatusName(status)
+//
+// # Requirements
+//
+//   - PostgreSQL 10+ with logical replication enabled
+//   - wal_level = logical in postgresql.conf
+//   - max_replication_slots > 0
+//   - Database user with REPLICATION privilege
+//
+// # Error Handling
+//
+// Any error during replication will cause the process to stop.
+// Check for errors with:
+//
+//	if err := repl.Err(); err != nil {
+//	    log.Printf("Replication error: %v", err)
+//	}
 package pglogrepl
 
 import (
@@ -20,21 +121,57 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+// Config holds the configuration for PostgreSQL logical replication.
+//
+// All connection parameters follow the standard PostgreSQL connection string format.
+// The replication process will create a publication and replication slot automatically
+// based on the provided names (or use defaults if not specified).
 type Config struct {
-	Host     string
-	Port     int
+	// Host is the PostgreSQL server hostname or IP address.
+	// Defaults to "localhost" if not specified.
+	Host string
+	// Port is the PostgreSQL server port number.
+	// Defaults to 5432 if not specified.
+	Port int
+	// Username is the PostgreSQL user for authentication.
+	// This user must have REPLICATION privilege.
 	Username string
+	// Password is the PostgreSQL user password.
 	Password string
+	// Database is the target database name for replication.
 	Database string
-	SSLMode  string
-	Tables   []string
-	Schema   string
-	PubName  string
+	// SSLMode controls the SSL/TLS connection mode.
+	// Valid values: disable, require, verify-ca, verify-full.
+	// Defaults to "disable" if not specified.
+	SSLMode string
+	// Tables is the list of table names to replicate (without schema prefix).
+	// If empty, all tables in the schema will be replicated.
+	// Example: []string{"users", "orders", "products"}
+	Tables []string
+	// Schema is the PostgreSQL schema name.
+	// Defaults to "public" if not specified.
+	Schema string
+	// PubName is the name for the logical replication publication.
+	// Defaults to "pglogrepl_demo" if not specified.
+	PubName string
+	// SlotName is the name for the replication slot.
+	// Defaults to PubName + "_sync_slot" if not specified.
 	SlotName string
-	LSNFile  string
-	Logger   Logger
+	// LSNFile is the file path for persisting the LSN (Log Sequence Number).
+	// This file is used for crash recovery and prevents data loss.
+	// The file contains the last processed WAL position.
+	LSNFile string
+	// Logger is the custom logger for replication events.
+	// If nil, a default stdout logger will be used.
+	Logger Logger
 }
 
+// PgLogRepl manages PostgreSQL logical replication with full and incremental synchronization.
+//
+// It maintains connections to PostgreSQL, tracks replication progress via LSN,
+// and dispatches data change events to registered callbacks.
+//
+// The replication process is thread-safe and supports graceful shutdown.
 type PgLogRepl struct {
 	dsn          string
 	database     string
@@ -55,6 +192,30 @@ type PgLogRepl struct {
 	closed chan chan struct{}
 }
 
+// New creates a new PgLogRepl instance with the provided configuration.
+//
+// This function initializes the replication manager with default values for
+// unspecified configuration fields. It does not establish database connections
+// or start replication - call Start() to begin the replication process.
+//
+// The function will:
+//   - Build the PostgreSQL connection string
+//   - Initialize the LSN tracking file
+//   - Set up event callback registry
+//   - Configure logging (uses stdout if no logger provided)
+//   - Sort and validate table names if specified
+//
+// Example:
+//
+//	config := pglogrepl.Config{
+//	    Host:     "localhost",
+//	    Username: "postgres",
+//	    Password: "secret",
+//	    Database: "mydb",
+//	    Tables:   []string{"users", "orders"},
+//	    LSNFile:  "/var/lib/app/lsn.dat",
+//	}
+//	repl := pglogrepl.New(config)
 func New(config Config) *PgLogRepl {
 	schema := cmp.Or(config.Schema, "public")
 	publication := cmp.Or(config.PubName, "pglogrepl_demo")
@@ -107,10 +268,48 @@ func New(config Config) *PgLogRepl {
 	return repl
 }
 
+// DSN returns the PostgreSQL connection string used by this replication instance.
+//
+// The DSN (Data Source Name) contains the connection parameters including host, port,
+// username, password, database, and SSL mode. This can be useful for:
+//   - Debugging connection issues
+//   - Creating additional connections with the same parameters
+//   - Passing to CheckLogicalReplication() for configuration verification
+//
+// Example:
+//
+//	repl := pglogrepl.New(config)
+//	dsn := repl.DSN()
+//
+//	// Check configuration before starting
+//	result, err := pglogrepl.CheckLogicalReplication(context.Background(), dsn)
+//	if !result.Supported {
+//	    log.Fatal("PostgreSQL not configured for logical replication")
+//	}
+func (p *PgLogRepl) DSN() string {
+	return p.dsn
+}
+
+// Status returns the current replication status.
+//
+// Returns one of the following status codes:
+//   - StatusStopped: Replication is not running
+//   - StatusStarting: Replication is initializing
+//   - StatusSyncing: Performing full table synchronization
+//   - StatusListening: Active incremental replication
+//   - StatusStopping: Gracefully shutting down
+//
+// Use StatusName() to convert the status code to a human-readable string.
 func (p *PgLogRepl) Status() int32 {
 	return p.status.Load()
 }
 
+// Err returns the last error that occurred during replication.
+//
+// If replication stopped due to an error, this method will return that error.
+// Returns nil if no error has occurred or if the error has been cleared.
+//
+// This method is thread-safe.
 func (p *PgLogRepl) Err() error {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -129,6 +328,38 @@ func (p *PgLogRepl) hasTable(table Table) bool {
 	return slices.ContainsFunc(p.tables, table.Equal)
 }
 
+// Start begins the replication process.
+//
+// This method performs the following steps:
+//  1. Initializes LSN tracking from file (if exists)
+//  2. Discovers or validates configured tables
+//  3. Creates publication and replication slot if needed
+//  4. Starts full synchronization (if no LSN) or incremental sync (if LSN exists)
+//  5. Begins periodic LSN persistence (every minute)
+//
+// If the LSN file doesn't exist or is invalid, full synchronization will be performed:
+//   - Creates a consistent database snapshot
+//   - Reads all rows from configured tables
+//   - Dispatches INSERT events for each row
+//   - Transitions to incremental synchronization
+//
+// If a valid LSN exists, incremental synchronization starts immediately:
+//   - Connects to the replication slot
+//   - Starts consuming WAL changes from the saved LSN position
+//   - Dispatches events for each data modification
+//
+// The method returns after the replication process is fully initialized and running.
+// Any error during startup will stop the process and return the error.
+//
+// This method can only be called when status is StatusStopped.
+// Calling Start() multiple times will return an error.
+//
+// Example:
+//
+//	ctx := context.Background()
+//	if err := repl.Start(ctx); err != nil {
+//	    log.Fatalf("Failed to start replication: %v", err)
+//	}
 func (p *PgLogRepl) Start(ctx context.Context) error {
 	if !p.status.CompareAndSwap(StatusStopped, StatusStarting) {
 		return errors.New("already started")
@@ -159,7 +390,7 @@ func (p *PgLogRepl) Start(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				err := p.lsn.Persist()
+				err := p.lsn.Sync()
 				if err != nil {
 					p.log.LogError("failed to persist lsn: %v", err)
 				}
@@ -723,6 +954,29 @@ func decodeTextColumnData(mi *pgtype.Map, data []byte, dataType uint32) (any, er
 	return string(data), nil
 }
 
+// Stop gracefully shuts down the replication process.
+//
+// This method will:
+//   - Signal all active goroutines to stop
+//   - Wait for ongoing operations to complete
+//   - Sync the final LSN to disk
+//   - Close database connections
+//   - Transition status to StatusStopped
+//
+// Stop is idempotent - calling it multiple times is safe and will return nil
+// if already stopped or stopping.
+//
+// Returns the last error that occurred during replication, or nil if no error.
+//
+// Example:
+//
+//	// Graceful shutdown on signal
+//	sigChan := make(chan os.Signal, 1)
+//	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+//	<-sigChan
+//	if err := repl.Stop(); err != nil {
+//	    log.Printf("Replication stopped with error: %v", err)
+//	}
 func (p *PgLogRepl) Stop() error {
 	switch p.Status() {
 	case StatusStopped, StatusStopping:
