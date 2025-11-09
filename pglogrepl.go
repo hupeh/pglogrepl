@@ -670,7 +670,7 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 	dispatch := func(event Event, relationID uint32, tuple *pglogrepl.TupleData) bool {
 		rel, ok := relationsV2[relationID]
 		if !ok {
-			p.log.LogError("unknown relation ID %d", relationID)
+			p.log.LogError("unknown relation ID %d for event %s", relationID, event)
 			return true
 		}
 
@@ -789,7 +789,6 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 				// events from rolled back transactions.
 
 			case *pglogrepl.CommitMessage:
-				clear(relationsV2)
 
 			case *pglogrepl.InsertMessageV2:
 				p.log.LogInfo("insert for xid %d", logicalMsg.Xid)
@@ -811,7 +810,19 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 
 			case *pglogrepl.TruncateMessageV2:
 				p.log.LogInfo("truncate for xid %d", logicalMsg.Xid)
-				// TODO: Implement truncate event dispatching
+				// TRUNCATE can affect multiple tables at once
+				for _, relationID := range logicalMsg.RelationIDs {
+					rel, ok := relationsV2[relationID]
+					if !ok {
+						p.log.LogError("unknown relation ID %d for truncate event", relationID)
+						continue
+					}
+					tbl := newTable(rel.Namespace, rel.RelationName)
+					// TRUNCATE doesn't have row data, pass empty map
+					if !p.dispatch(EventTruncate, tbl, map[string]any{}) {
+						return
+					}
+				}
 
 			case *pglogrepl.TypeMessageV2:
 			case *pglogrepl.OriginMessage:
@@ -827,7 +838,6 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 				p.log.LogInfo("Stream stop message")
 			case *pglogrepl.StreamCommitMessageV2:
 				p.log.LogInfo("Stream commit message: xid %d", logicalMsg.Xid)
-				clear(relationsV2)
 			case *pglogrepl.StreamAbortMessageV2:
 				p.log.LogInfo("Stream abort message: xid %d", logicalMsg.Xid)
 			default:
