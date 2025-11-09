@@ -16,6 +16,10 @@ type Logger interface {
 	// LogWarn logs warning messages for unexpected but non-fatal situations.
 	// Examples: unknown tables, mismatched events, configuration issues.
 	LogWarn(format string, args ...any)
+
+	// LogDebug logs debug-level messages for troubleshooting and detailed monitoring.
+	// Examples: protocol details, internal state changes, performance metrics.
+	LogDebug(format string, args ...any)
 }
 
 // LoggerFunc is a function adapter that implements the Logger interface.
@@ -44,4 +48,9 @@ func (f LoggerFunc) LogError(format string, args ...any) {
 // LogWarn implements the Logger interface.
 func (f LoggerFunc) LogWarn(format string, args ...any) {
 	f("WARN", format, args...)
+}
+
+// LogDebug implements the Logger interface.
+func (f LoggerFunc) LogDebug(format string, args ...any) {
+	f("DEBUG", format, args...)
 }

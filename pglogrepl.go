@@ -631,7 +631,7 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 		onDone(err)
 		return
 	}
-	p.log.LogInfo(
+	p.log.LogDebug(
 		"SystemID=%q Timeline=%d XLogPos=%q DBName=%q",
 		sysident.SystemID,
 		sysident.Timeline,
@@ -694,7 +694,7 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 
 		tbl := newTable(rel.Namespace, rel.RelationName)
 
-		p.log.LogInfo("dispatch event %q, table %q, values %v", event, tbl, values)
+		p.log.LogDebug("dispatch event %q, table %q, values %v", event, tbl, values)
 
 		return p.dispatch(event, tbl, values)
 	}
@@ -713,7 +713,7 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 				p.setError(err)
 				return
 			}
-			p.log.LogInfo("sent standby status message at %q", clientXLogPos)
+			p.log.LogDebug("sent standby status message at %q", clientXLogPos)
 			nextStandbyMessageDeadline = time.Now().Add(standbyMessageTimeout)
 		}
 
@@ -735,7 +735,7 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 
 		msg, ok := rawMsg.(*pgproto3.CopyData)
 		if !ok {
-			p.log.LogInfo("Received unexpected message: %T", rawMsg)
+			p.log.LogDebug("Received unexpected message: %T", rawMsg)
 			continue
 		}
 
@@ -746,7 +746,7 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 				p.setError(err)
 				return
 			}
-			p.log.LogInfo(
+			p.log.LogDebug(
 				"Primary Keepalive Message => ServerWALEnd %q ServerTime %q ReplyRequested %t",
 				pkm.ServerWALEnd,
 				pkm.ServerTime,
@@ -767,7 +767,7 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 				return
 			}
 
-			p.log.LogInfo(
+			p.log.LogDebug(
 				"XLogData => WALStart %q ServerWALEnd %q ServerTime %q WALData",
 				xld.WALStart, xld.ServerWALEnd, xld.ServerTime,
 			)
@@ -777,7 +777,7 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 				p.setError(fmt.Errorf("failed to parse logical replication message: %w", err))
 				return
 			}
-			p.log.LogInfo("Receive a logical replication message: %s", logicalMsg.Type())
+			p.log.LogDebug("Receive a logical replication message: %s", logicalMsg.Type())
 
 			switch logicalMsg := logicalMsg.(type) {
 			case *pglogrepl.RelationMessageV2:
@@ -791,25 +791,25 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 			case *pglogrepl.CommitMessage:
 
 			case *pglogrepl.InsertMessageV2:
-				p.log.LogInfo("insert for xid %d", logicalMsg.Xid)
+				p.log.LogDebug("insert for xid %d", logicalMsg.Xid)
 				if !dispatch(EventInsert, logicalMsg.RelationID, logicalMsg.Tuple) {
 					return
 				}
 
 			case *pglogrepl.UpdateMessageV2:
-				p.log.LogInfo("update for xid %d", logicalMsg.Xid)
+				p.log.LogDebug("update for xid %d", logicalMsg.Xid)
 				if !dispatch(EventUpdate, logicalMsg.RelationID, logicalMsg.NewTuple) {
 					return
 				}
 
 			case *pglogrepl.DeleteMessageV2:
-				p.log.LogInfo("delete for xid %d", logicalMsg.Xid)
+				p.log.LogDebug("delete for xid %d", logicalMsg.Xid)
 				if !dispatch(EventDelete, logicalMsg.RelationID, logicalMsg.OldTuple) {
 					return
 				}
 
 			case *pglogrepl.TruncateMessageV2:
-				p.log.LogInfo("truncate for xid %d", logicalMsg.Xid)
+				p.log.LogDebug("truncate for xid %d", logicalMsg.Xid)
 				// TRUNCATE can affect multiple tables at once
 				for _, relationID := range logicalMsg.RelationIDs {
 					rel, ok := relationsV2[relationID]
@@ -828,18 +828,18 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 			case *pglogrepl.OriginMessage:
 
 			case *pglogrepl.LogicalDecodingMessageV2:
-				p.log.LogInfo("Logical decoding message: %q, %q, %d", logicalMsg.Prefix, logicalMsg.Content, logicalMsg.Xid)
+				p.log.LogDebug("Logical decoding message: %q, %q, %d", logicalMsg.Prefix, logicalMsg.Content, logicalMsg.Xid)
 
 			case *pglogrepl.StreamStartMessageV2:
 				inStream = true
-				p.log.LogInfo("Stream start message: xid %d, first segment? %d", logicalMsg.Xid, logicalMsg.FirstSegment)
+				p.log.LogDebug("Stream start message: xid %d, first segment? %d", logicalMsg.Xid, logicalMsg.FirstSegment)
 			case *pglogrepl.StreamStopMessageV2:
 				inStream = false
-				p.log.LogInfo("Stream stop message")
+				p.log.LogDebug("Stream stop message")
 			case *pglogrepl.StreamCommitMessageV2:
-				p.log.LogInfo("Stream commit message: xid %d", logicalMsg.Xid)
+				p.log.LogDebug("Stream commit message: xid %d", logicalMsg.Xid)
 			case *pglogrepl.StreamAbortMessageV2:
-				p.log.LogInfo("Stream abort message: xid %d", logicalMsg.Xid)
+				p.log.LogDebug("Stream abort message: xid %d", logicalMsg.Xid)
 			default:
 				p.log.LogInfo("Unknown message type in pgoutput stream: %T", logicalMsg)
 			}
