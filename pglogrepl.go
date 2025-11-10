@@ -488,7 +488,7 @@ func (p *PgLogRepl) initTables(ctx context.Context) error {
 }
 
 func (p *PgLogRepl) fullSync(ctx context.Context, onDone func(error)) {
-	// 创建快照连接
+	// Create snapshot connection
 	snapConn, err := pgconn.Connect(ctx, p.dsn)
 	if err != nil {
 		onDone(err)
@@ -496,13 +496,13 @@ func (p *PgLogRepl) fullSync(ctx context.Context, onDone func(error)) {
 	}
 	defer snapConn.Close(ctx)
 
-	// 开启事务且设置隔离级别为 REPEATABLE READ
+	// Begin transaction with REPEATABLE READ isolation level
 	_, err = snapConn.Exec(ctx, "BEGIN ISOLATION LEVEL REPEATABLE READ").ReadAll()
 	if err != nil {
 		onDone(err)
 		return
 	}
-	// 导出快照
+	// Export snapshot
 	rows, err := snapConn.Exec(ctx, "SELECT pg_export_snapshot()").ReadAll()
 	if err != nil {
 		snapConn.Exec(ctx, "ROLLBACK")
@@ -515,15 +515,15 @@ func (p *PgLogRepl) fullSync(ctx context.Context, onDone func(error)) {
 		return
 	}
 
-	// 由于我们利用一致性快照实现数据的全量同步，
-	// 就必须保证快照和同步的事务同时存在，所以
-	// 这里使用 defer 保证事务在全量同步时可用。
+	// Since we use a consistent snapshot to implement full synchronization,
+	// we must ensure the snapshot and sync transactions coexist.
+	// Using defer here ensures the transaction remains available during full sync.
 	defer snapConn.Exec(ctx, "COMMIT")
 
-	// 获取快照名称
+	// Get snapshot name
 	snapshotName := string(rows[0].Rows[0][0])
 
-	// 创建全量同步连接
+	// Create full sync connection
 	syncConn, err := pgconn.Connect(ctx, p.dsn)
 	if err != nil {
 		onDone(err)
@@ -531,7 +531,7 @@ func (p *PgLogRepl) fullSync(ctx context.Context, onDone func(error)) {
 	}
 	defer syncConn.Close(ctx)
 
-	// 开启事务
+	// Begin transaction
 	_, err = syncConn.Exec(ctx, "BEGIN ISOLATION LEVEL REPEATABLE READ").ReadAll()
 	if err != nil {
 		onDone(err)
@@ -545,13 +545,13 @@ func (p *PgLogRepl) fullSync(ctx context.Context, onDone func(error)) {
 		return
 	}
 
-	// 启动完成
+	// Startup completed
 	p.status.CompareAndSwap(StatusStarting, StatusSyncing)
 	onDone(nil)
 
 	typeMap := pgtype.NewMap()
 
-	// 开始全量同步
+	// Begin full synchronization
 	for _, tbl := range p.tables {
 		sql := fmt.Sprintf("SELECT * FROM %s;", tbl.String())
 		res := syncConn.ExecParams(ctx, sql, nil, nil, nil, nil)
@@ -581,14 +581,14 @@ func (p *PgLogRepl) fullSync(ctx context.Context, onDone func(error)) {
 		}
 	}
 
-	// 提交事务
+	// Commit transaction
 	_, err = syncConn.Exec(ctx, "COMMIT").ReadAll()
 	if err != nil {
 		p.setError(err)
 		return
 	}
 
-	// 开始监听数据库变化，实现增量同步
+	// Start listening for database changes to implement incremental sync
 	if p.Err() == nil {
 		go p.incrementalSync(ctx, func(err error) {
 			if err != nil {
@@ -602,7 +602,7 @@ func (p *PgLogRepl) fullSync(ctx context.Context, onDone func(error)) {
 	}
 }
 
-// 增量同步
+// Incremental synchronization
 func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 	conn, err := pgconn.Connect(ctx, p.dsn+" replication=database")
 	if err != nil {
@@ -611,21 +611,21 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 	}
 	defer conn.Close(ctx)
 
-	// 创建 publication
+	// Create publication
 	err = p.ensurePublication(ctx, conn)
 	if err != nil {
 		onDone(err)
 		return
 	}
 
-	// 创建插槽
+	// Create replication slot
 	err = p.ensureReplicationSlot(ctx, conn)
 	if err != nil {
 		onDone(err)
 		return
 	}
 
-	// 确保同步位置正确
+	// Ensure sync position is correct
 	sysident, err := pglogrepl.IdentifySystem(ctx, conn)
 	if err != nil {
 		onDone(err)
@@ -641,7 +641,7 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 
 	startLSN := min(p.lsn.Get(), sysident.XLogPos)
 
-	// 启动插槽
+	// Start replication slot
 	err = pglogrepl.StartReplication(ctx, conn, p.slotName, startLSN, pglogrepl.StartReplicationOptions{
 		// streaming of large transactions is available since PG 14 (protocol version 2)
 		// we also need to set 'streaming' to 'true'
@@ -658,7 +658,7 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 	}
 	p.log.LogInfo("logical replication started on slot %q", p.slotName)
 
-	// 启动完成
+	// Startup completed
 	onDone(nil)
 
 	clientXLogPos := startLSN
@@ -703,7 +703,7 @@ func (p *PgLogRepl) incrementalSync(ctx context.Context, onDone func(error)) {
 	// on StreamStopMessage we set it back to false
 	inStream := false
 
-	// 监听数据库变化，实现增量同步
+	// Listen for database changes to implement incremental sync
 	for {
 		if time.Now().After(nextStandbyMessageDeadline) {
 			err = pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{
@@ -859,7 +859,7 @@ func (p *PgLogRepl) ensurePublication(ctx context.Context, conn *pgconn.PgConn) 
 		return err
 	}
 
-	// 存在 publication
+	// Publication exists
 	if len(pgRes) > 0 && len(pgRes[0].Rows) > 0 {
 		sql := "SELECT schemaname||'.'||tablename FROM pg_publication_tables WHERE pubname = '%s'"
 		pgRes, err = conn.Exec(ctx, fmt.Sprintf(sql, p.pubName)).ReadAll()
@@ -870,17 +870,17 @@ func (p *PgLogRepl) ensurePublication(ctx context.Context, conn *pgconn.PgConn) 
 		for _, result := range pgRes {
 			for _, row := range result.Rows {
 				if p.hasTable(Table(row[0])) {
-					// 允许数据库中的表多于指定的表，所以这里只统计交集
+					// Allow more tables in database than specified, so only count intersection
 					intersects++
 				}
 			}
 		}
-		// 指定的表是 publication 关联表的子集
+		// Specified tables are a subset of publication tables
 		if intersects == len(p.tables) {
 			return nil
 		}
 
-		// 检查并删除插槽
+		// Check and delete replication slot
 		checkSQL = "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1"
 		res := conn.ExecParams(ctx, checkSQL, nil, nil, nil, nil).Read()
 		if res.Err != nil {
@@ -931,7 +931,7 @@ func (p *PgLogRepl) ensureReplicationSlot(ctx context.Context, conn *pgconn.PgCo
 				return fmt.Errorf("expect database '%s', got '%s'", p.database, row[3])
 			}
 
-			// 检查属性是否一致
+			// Check if attributes are consistent
 			if !bytes.EqualFold(row[1], []byte("pgoutput")) ||
 				bytes.EqualFold(row[4], []byte{'t'}) ||
 				!bytes.EqualFold(row[2], []byte("LOGICAL")) {

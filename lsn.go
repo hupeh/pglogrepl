@@ -82,8 +82,8 @@ func (l *LSN) Valid() bool {
 //	    log.Printf("Failed to update LSN: %v", err)
 //	}
 func (l *LSN) Set(lsn pglogrepl.LSN) error {
-	// 理论上 lsn 不能小于 l.value，但是由于我们对逻辑复制没有采用并发处理，
-	// 所以这里只做不相等校验
+	// Theoretically, lsn should not be less than l.value, but since we don't use
+	// concurrent processing for logical replication, we only check for inequality here
 	if l.value.Swap(uint64(lsn)) != uint64(lsn) {
 		return l.write()
 	}
@@ -129,7 +129,7 @@ func (l *LSN) Reload() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// 如果文件已打开，先关闭
+	// If file is already open, close it first
 	if l.file != nil {
 		l.file.Close()
 		l.file = nil
@@ -138,7 +138,7 @@ func (l *LSN) Reload() error {
 	file, err := os.Open(l.filename)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// 文件不存在，创建新文件
+			// File does not exist, create new file
 			return l.openFile()
 		}
 		return fmt.Errorf("failed to reload LSN: %w", err)
@@ -171,7 +171,7 @@ func (l *LSN) Reload() error {
 
 	l.value.Store(uint64(val))
 
-	// 重新打开文件用于写入
+	// Reopen file for writing
 	return l.openFile()
 }
 
@@ -230,17 +230,17 @@ func (l *LSN) write() error {
 
 	str := fmt.Sprintf("%d/%s", l.checksum, l.Get().String())
 
-	// 先 Seek 到文件开头
+	// Seek to the beginning of the file first
 	if _, err := l.file.Seek(0, 0); err != nil {
 		return fmt.Errorf("failed to seek %w file: %w", errLSN, err)
 	}
 
-	// 写入数据
+	// Write data
 	if _, err := l.file.WriteString(str); err != nil {
 		return fmt.Errorf("failed to write %w: %w", errLSN, err)
 	}
 
-	// 截断文件（如果新内容比旧内容短）
+	// Truncate file (if new content is shorter than old content)
 	if err := l.file.Truncate(int64(len(str))); err != nil {
 		return fmt.Errorf("failed to truncate %w file: %w", errLSN, err)
 	}
@@ -316,14 +316,14 @@ func (l *LSN) Close() error {
 		return nil
 	}
 
-	// 同步到磁盘
+	// Sync to disk
 	if err := l.file.Sync(); err != nil {
 		l.file.Close()
 		l.file = nil
 		return fmt.Errorf("failed to sync %w file on close: %w", errLSN, err)
 	}
 
-	// 关闭文件
+	// Close file
 	if err := l.file.Close(); err != nil {
 		l.file = nil
 		return fmt.Errorf("failed to close %w file: %w", errLSN, err)
