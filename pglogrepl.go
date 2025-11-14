@@ -914,7 +914,16 @@ func (p *PgLogRepl) ensurePublication(ctx context.Context, conn *pgconn.PgConn) 
 		)
 	}
 	_, err = conn.Exec(ctx, createSQL).ReadAll()
-	return err
+	if err != nil {
+		// Check if error is "publication already exists" (SQLSTATE 42710)
+		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "42710" {
+			// Publication already exists, this is safe to ignore
+			p.log.LogInfo("publication %q already exists, skipping creation", p.pubName)
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (p *PgLogRepl) ensureReplicationSlot(ctx context.Context, conn *pgconn.PgConn) error {
@@ -954,7 +963,17 @@ func (p *PgLogRepl) ensureReplicationSlot(ctx context.Context, conn *pgconn.PgCo
 		Mode:           pglogrepl.LogicalReplication,
 	})
 
-	return err
+	if err != nil {
+		// Check if error is "replication slot already exists" (SQLSTATE 42710)
+		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "42710" {
+			// Slot already exists, this is safe to ignore
+			p.log.LogInfo("replication slot %q already exists, skipping creation", p.slotName)
+			return nil
+		}
+		return err
+	}
+
+	return nil
 }
 
 func decodeTextColumnData(mi *pgtype.Map, data []byte, dataType uint32) (any, error) {
